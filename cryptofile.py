@@ -2,7 +2,7 @@ import hashlib
 import itertools
 import tempfile
 from io import BytesIO, RawIOBase
-from typing import Iterable
+from typing import Iterable, Optional
 
 
 MEGABYTE = 1024 * 1024
@@ -14,11 +14,7 @@ class HashVerificationError(Exception):
 
 
 def encrypt_block(data: Iterable[int], key: Iterable[int]) -> bytes:
-    res = b''
-    for byte in data:
-        keychar = next(key)
-        res += bytes([(byte + keychar) % 256])
-    return res
+    return bytes((b + next(key)) % 256 for b in data)
 
 
 def encrypt(infile: RawIOBase, outfile: RawIOBase, key=None, chunksize=MEGABYTE):
@@ -51,11 +47,7 @@ def encrypt(infile: RawIOBase, outfile: RawIOBase, key=None, chunksize=MEGABYTE)
 
 
 def decrypt_block(data: Iterable[int], key: Iterable[int]) -> bytes:
-    res = b''
-    for byte in data:
-        keychar = next(key)
-        res += bytes([(byte - keychar) % 256])
-    return res
+    return bytes([(b - next(key)) % 256 for b in data])
 
 
 def decrypt(infile: RawIOBase, outfile: RawIOBase, key=None, verify_hash=True, chunksize=MEGABYTE):
@@ -84,6 +76,71 @@ def decrypt(infile: RawIOBase, outfile: RawIOBase, key=None, verify_hash=True, c
             exc.correct_hash = stored_hash
             exc.actual_hash = verification_digest
             raise exc
+
+
+class EncryptedFile(RawIOBase):
+    def __init__(self, name, mode='r', key:bytes = None, verify_hash=True, chunksize=MEGABYTE, tempobj: RawIOBase = None):
+        self._wrapped = open(name, mode + 'b')
+        if tempobj is None:
+            tempobj = tempfile.SpooledTemporaryFile(chunksize)
+            tempobj.seekable = (lambda: True) # Fix for BPO-35112
+        self._temp = tempobj
+        if 'r' in mode or '+' in mode:
+            decrypt(self._wrapped, self._temp, key, verify_hash, chunksize)
+        # self._temp2 = tempfile.SpooledTemporaryFile(chunksize)
+        self.name = name
+        self.mode = mode
+        self.key = key
+        self.verify_hash = verify_hash
+        self.chunksize = chunksize
+        self._closed = False
+
+    def read(self, size: int = None) -> bytes:
+        return self._temp.read(size)
+
+    def write(self, b: bytes) -> int:
+        return self._temp.write(b)
+    
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return self._temp.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._temp.tell()
+    
+    def flush(self):
+        if 'w' not in self.mode or '+' not in self.mode:
+            return
+        if self._closed:
+            raise ValueError('I/O operation on closed file.')
+        self._temp.seek(0)
+        self._wrapped.seek(0)
+        return encrypt(self._temp, self._wrapped, self.key, self.chunksize)
+    
+    def seekable(self) -> bool:
+        return self._temp.seekable()
+    
+    def readable(self) -> bool:
+        return self._wrapped.readable()
+    
+    def writable(self) -> bool:
+        return self._wrapped.writable()
+    
+    def close(self):
+        self.flush()
+        self._closed = True
+        self._temp.close()
+        self._wrapped.close()
+
+    def __del__(self):
+        if self._closed:
+            return
+        self.close()
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, *exc_info) -> Optional[bool]:
+        return
 
 
 if __name__ == '__main__':
